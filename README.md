@@ -32,8 +32,8 @@ AI Fusion 是一个可将多个 LLM 提供商与模型组合在一起、并发�
 ### 1) 安装依赖
 
 ```bash
-git clone https://github.com/Ren1104/ai-fusion-agent.git
-cd ai-fustion-agent
+git clone https://github.com/Ren1104/fusion-agent.git
+cd fusion-agent
 pip install -r requirements.txt
 ```
 
