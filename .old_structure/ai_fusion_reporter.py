@@ -60,157 +60,52 @@ class AIFusionReporter:
         return filepath
     
     def _build_report_content(
-        self, 
-        question: str, 
+        self,
+        question: str,
         question_type: str,
-        llm_responses: List[Dict], 
+        llm_responses: List[Dict],
         final_answer: str,
         selected_models: List[str],
         quality_analysis: Optional[Dict[str, Any]] = None,
         selection_analysis: Optional[Dict[str, Any]] = None
     ) -> str:
-        """构建报告内容"""
-        
+        """构建报告内容 - 优化版，专注于融合回答和最佳模型表现"""
+
         # 统计信息
         total_models = len(llm_responses)
-        avg_response_time = sum(r.get('response_time', 0) for r in llm_responses) / total_models if total_models > 0 else 0
-        fastest_model = min(llm_responses, key=lambda x: x.get('response_time', float('inf')))
-        slowest_model = max(llm_responses, key=lambda x: x.get('response_time', 0))
-        
-        # 响应长度统计
-        response_lengths = [(r['model_name'], len(r['response'])) for r in llm_responses]
-        
+        fusion_length = len(final_answer)
+
         report = f"""# AI Fusion 分析报告
 
 ## 📋 基本信息
 - **生成时间**: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 - **问题类型**: {question_type}
 - **参与模型数量**: {total_models}
-- **选择的模型**: {', '.join(selected_models)}
 
 ## ❓ 用户问题
 ```
 {question}
 ```
 
-## 🧠 智能模型选择分析
-
-{self._generate_selection_analysis_section(selection_analysis)}
-
-## ⏱️ 性能分析
-
-### 响应时间统计
-- **平均响应时间**: {avg_response_time:.2f}秒
-- **最快模型**: {fastest_model['model_name']} ({fastest_model.get('response_time', 0):.2f}秒)
-- **最慢模型**: {slowest_model['model_name']} ({slowest_model.get('response_time', 0):.2f}秒)
-
-### 详细响应时间
-| 模型名称 | 响应时间(秒) | 响应长度(字符) | 状态 |
-|---------|-------------|---------------|------|
-"""
-        
-        # 添加每个模型的详细信息
-        for response in llm_responses:
-            status = "✅ 成功" if response['success'] else "❌ 失败"
-            report += f"| {response['model_name']} | {response.get('response_time', 0):.2f} | {len(response['response'])} | {status} |\n"
-        
-        report += f"""
-## 🤖 各模型回答详情
-
-"""
-        
-        # 添加每个模型的具体回答
-        for i, response in enumerate(llm_responses, 1):
-            if response['success']:
-                report += f"""### {i}. {response['model_name']}
-**响应时间**: {response.get('response_time', 0):.2f}秒  
-**字符数**: {len(response['response'])}
-
-```
-{response['response']}
-```
-
----
-
-"""
-            else:
-                report += f"""### {i}. {response['model_name']} (失败)
-**响应时间**: {response.get('response_time', 0):.2f}秒  
-**错误信息**: {response.get('error', 'Unknown error')}
-
----
-
-"""
-        
-        report += f"""## 🎯 AI Fusion 融合回答
-**字符数**: {len(final_answer)}
+## 🎯 AI Fusion 融合回答
+**字符数**: {fusion_length}
 
 ```
 {final_answer}
 ```
 
-## 📊 质量分析
-
-### 回答长度对比
-"""
-        
-        # 添加长度对比图表（文本形式）
-        max_length = max(len(r['response']) for r in llm_responses) if llm_responses else 0
-        fusion_length = len(final_answer)
-        
-        for response in llm_responses:
-            length = len(response['response'])
-            bar_length = int(length / max_length * 20) if max_length > 0 else 0
-            bar = "█" * bar_length + "░" * (20 - bar_length)
-            report += f"- **{response['model_name']}**: {bar} ({length} 字符)\n"
-        
-        fusion_bar_length = int(fusion_length / max_length * 20) if max_length > 0 else 0
-        fusion_bar = "█" * fusion_bar_length + "░" * (20 - fusion_bar_length)
-        report += f"- **融合回答**: {fusion_bar} ({fusion_length} 字符)\n"
-        
-        report += f"""
-### 响应速度排名
-"""
-        
-        # 按响应时间排序
-        sorted_responses = sorted(llm_responses, key=lambda x: x.get('response_time', float('inf')))
-        for i, response in enumerate(sorted_responses, 1):
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-            report += f"{medal} **{response['model_name']}**: {response.get('response_time', 0):.2f}秒\n"
-        
-        report += f"""
-## 🔍 融合效果分析
-
-### 融合回答的优势
-- 综合了{total_models}个不同模型的观点
-- 平均处理时间: {avg_response_time:.2f}秒
-- 回答长度: {fusion_length}字符
-
-### 与原回答的差异
-融合回答通过整合多个模型的优势，提供了更全面和平衡的回答。相比单一模型的回答：
-
-1. **内容完整性**: 融合了各模型的关键信息点
-2. **观点平衡**: 避免了单一模型的偏见
-3. **准确性提升**: 通过多模型验证提高了答案可靠性
-
 ## 🏆 最佳模型表现
 
 {self._generate_best_models_section(llm_responses, quality_analysis)}
 
-## 💡 智能建议与总结
-
-{self._generate_intelligent_recommendations(question_type, llm_responses, final_answer, quality_analysis, selection_analysis)}
-
-{self._generate_quality_summary(quality_analysis)}
-
 ---
 *本报告由 AI Fusion 系统自动生成*
 """
-        
+
         return report
     
     def _generate_best_models_section(self, llm_responses: List[Dict], quality_analysis: Optional[Dict[str, Any]]) -> str:
-        """生成最佳模型表现部分 - 显示最快和最高质量的模型"""
+        """生成最佳模型表现部分 - 显示最快和最高质量的模型，包含详细的评分计算说明"""
         section = ""
 
         # 找出响应时间最快的模型
@@ -222,7 +117,7 @@ class AIFusionReporter:
             section += f"- 响应时间: {fastest_model.get('response_time', 0):.2f}秒\n"
             section += f"- 回答长度: {len(fastest_model['response'])}字符\n\n"
 
-        # 找出质量最高的模型
+        # 找出质量最高的模型并详细说明评分计算
         if quality_analysis and 'quality_ranking' in quality_analysis:
             ranking = quality_analysis['quality_ranking']
             # 找到质量最高的非融合回答
@@ -230,12 +125,69 @@ class AIFusionReporter:
 
             if best_model_entry:
                 section += f"### 🏆 质量评分最高\n\n"
-                section += f"**{best_model_entry['source']}**\n"
-                section += f"- 综合评分: {best_model_entry['overall_score']:.1f}/10\n"
-                section += f"- 完整性: {best_model_entry['completeness']:.1f}/10\n"
-                section += f"- 准确性: {best_model_entry['accuracy']:.1f}/10\n"
-                section += f"- 清晰度: {best_model_entry['clarity']:.1f}/10\n"
-                section += f"- 相关性: {best_model_entry['relevance']:.1f}/10\n\n"
+                section += f"**{best_model_entry['source']}**\n\n"
+
+                # 综合评分
+                section += f"#### 📊 综合评分: {best_model_entry['overall_score']:.1f}/10\n\n"
+
+                # 详细评分分解
+                section += f"#### 🔍 评分细节\n\n"
+
+                # 获取LLM评估详情
+                llm_evals = quality_analysis.get('llm_evaluations', {})
+                model_eval = llm_evals.get(best_model_entry['source'])
+
+                if model_eval:
+                    # 完整性评分
+                    completeness = best_model_entry['completeness']
+                    section += f"**1. 完整性评分: {completeness:.1f}/10**\n"
+                    section += f"- 评估标准: 回答是否覆盖问题的所有关键方面\n"
+                    if hasattr(model_eval, 'completeness_reasoning'):
+                        section += f"- 评分理由: {model_eval.completeness_reasoning}\n"
+                    section += "\n"
+
+                    # 准确性评分
+                    accuracy = best_model_entry['accuracy']
+                    section += f"**2. 准确性评分: {accuracy:.1f}/10**\n"
+                    section += f"- 评估标准: 信息是否准确无误，逻辑是否严密\n"
+                    if hasattr(model_eval, 'accuracy_reasoning'):
+                        section += f"- 评分理由: {model_eval.accuracy_reasoning}\n"
+                    section += "\n"
+
+                    # 清晰度评分
+                    clarity = best_model_entry['clarity']
+                    section += f"**3. 清晰度评分: {clarity:.1f}/10**\n"
+                    section += f"- 评估标准: 表达是否清晰易懂，结构是否合理\n"
+                    if hasattr(model_eval, 'clarity_reasoning'):
+                        section += f"- 评分理由: {model_eval.clarity_reasoning}\n"
+                    section += "\n"
+
+                    # 相关性评分
+                    relevance = best_model_entry['relevance']
+                    section += f"**4. 相关性评分: {relevance:.1f}/10**\n"
+                    section += f"- 评估标准: 内容是否切题，是否直接回答了问题\n"
+                    if hasattr(model_eval, 'relevance_reasoning'):
+                        section += f"- 评分理由: {model_eval.relevance_reasoning}\n"
+                    section += "\n"
+
+                    # 综合评分计算说明
+                    section += f"**综合评分计算方式:**\n"
+                    section += f"```\n"
+                    section += f"综合评分 = (完整性 + 准确性 + 清晰度 + 相关性) / 4\n"
+                    section += f"         = ({completeness:.1f} + {accuracy:.1f} + {clarity:.1f} + {relevance:.1f}) / 4\n"
+                    section += f"         = {best_model_entry['overall_score']:.1f}/10\n"
+                    section += f"```\n\n"
+
+                    # 总体评价
+                    if hasattr(model_eval, 'overall_assessment'):
+                        section += f"**💭 总体评价:**\n{model_eval.overall_assessment}\n\n"
+                else:
+                    # 如果没有详细评估数据，显示基本信息
+                    section += f"- 完整性: {best_model_entry['completeness']:.1f}/10\n"
+                    section += f"- 准确性: {best_model_entry['accuracy']:.1f}/10\n"
+                    section += f"- 清晰度: {best_model_entry['clarity']:.1f}/10\n"
+                    section += f"- 相关性: {best_model_entry['relevance']:.1f}/10\n\n"
+                    section += f"**综合评分** = (完整性 + 准确性 + 清晰度 + 相关性) / 4 = {best_model_entry['overall_score']:.1f}/10\n\n"
         else:
             section += f"### 🏆 质量评分最高\n\n"
             section += f"_质量分析数据不可用_\n\n"

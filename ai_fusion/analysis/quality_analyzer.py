@@ -7,7 +7,7 @@ import re
 import asyncio
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from ai_fusion_utils import call_llm_async
+from ai_fusion.utils.helpers import call_llm_async
 import hashlib
 import json
 
@@ -2343,21 +2343,21 @@ class AIFusionQualityAnalyzer:
 
         # 时间敏感场景
         recommendations['time_critical'] = (
-            f"推荐使用 {fastest['name']} "
+            f"推荐使用 {fastest['model_name']} "
             f"(响应时间: {fastest['response_time']:.2f}秒, "
             f"质量: {fastest['quality_score']:.1f}/10)"
         )
 
         # 质量优先场景
         recommendations['quality_critical'] = (
-            f"推荐使用 {highest_quality['name']} "
+            f"推荐使用 {highest_quality['model_name']} "
             f"(质量: {highest_quality['quality_score']:.1f}/10, "
             f"响应时间: {highest_quality['response_time']:.2f}秒)"
         )
 
         # 综合场景（性价比）
         recommendations['balanced'] = (
-            f"推荐使用 {most_efficient['name']} "
+            f"推荐使用 {most_efficient['model_name']} "
             f"(效率得分: {most_efficient['efficiency_score']:.2f}, "
             f"质量: {most_efficient['quality_score']:.1f}/10, "
             f"响应时间: {most_efficient['response_time']:.2f}秒)"
@@ -2370,7 +2370,7 @@ class AIFusionQualityAnalyzer:
             )
         else:
             recommendations['production'] = (
-                f"生产环境可考虑效率最优的 {most_efficient['name']}"
+                f"生产环境可考虑效率最优的 {most_efficient['model_name']}"
             )
 
         return recommendations
