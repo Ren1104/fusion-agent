@@ -12,7 +12,8 @@ class AIFusionReporter:
     """AI Fusion报告生成器"""
     
     def __init__(self):
-        self.report_dir = "reports"
+        # 从环境变量获取报告目录，如果未设置则使用默认值"reports"
+        self.report_dir = os.getenv("AI_FUSION_REPORT_DIR", "reports")
         self._ensure_report_dir()
     
     def _ensure_report_dir(self):
@@ -31,7 +32,7 @@ class AIFusionReporter:
         selection_analysis: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        生成完整的markdown分析报告
+        生成完整的分析报告
         
         Args:
             question: 用户问题

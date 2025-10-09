@@ -78,12 +78,25 @@ async def call_llm_async(
 ) -> str:
     """
     异步调用LLM的通用函数
-    统一使用OpenAI客户端调用所有模型（包括Claude等）
+    根据模型类型使用相应的提供商调用模型
 
-    向后兼容：保留原有实现
+    向后兼容：保留原有参数格式
     """
 
-    # 使用传入的参数，或从环境变量获取
+    # 尝试使用新的 ModelRegistry 方式
+    try:
+        registry = get_model_registry()
+        if registry:
+            return await registry.call_model(
+                model_id=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+    except Exception as e:
+        print(f"⚠️ ModelRegistry 调用失败，回退到传统方式: {str(e)}")
+
+    # 回退到原有的 OpenAI 兼容方式
     api_key = api_key or os.getenv("OPENAI_API_KEY")
     base_url = base_url or os.getenv("OPENAI_BASE_URL")
 
