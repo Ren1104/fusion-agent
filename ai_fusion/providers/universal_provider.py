@@ -24,7 +24,7 @@ class UniversalProvider(BaseProvider):
     包括：官方 OpenAI、Azure OpenAI、第三方代理服务等
     """
 
-    # 默认模型知识库（基于你当前项目的模型列表）
+    # 默认模型知识库（基于当前项目的模型列表）
     DEFAULT_MODELS_KNOWLEDGE = {
         "qwen-max": {
             "display_name": "通义千问 Max",
