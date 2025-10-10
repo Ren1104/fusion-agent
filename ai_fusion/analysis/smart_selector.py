@@ -7,7 +7,7 @@ import json
 import re
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from ai_fusion.utils.helpers import call_llm_async, ModelConfig
+from ai_fusion.utils.utils import call_llm_async, ModelConfig
 
 
 @dataclass

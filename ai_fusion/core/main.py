@@ -6,7 +6,7 @@ AI Fusion - 程序入口
 import asyncio
 
 from ai_fusion.core.flow import create_ai_fusion_flow
-from ai_fusion.utils.helpers import get_available_models, validate_environment
+from ai_fusion.utils.utils import get_available_models, validate_environment
 
 
 async def process_question(question: str):

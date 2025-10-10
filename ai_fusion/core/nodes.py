@@ -9,7 +9,7 @@ from typing import List, Dict, Any
 from datetime import datetime
 
 from pocketflow import AsyncNode
-from ai_fusion.utils.helpers import call_llm_async, ModelConfig
+from ai_fusion.utils.utils import call_llm_async, ModelConfig
 from ai_fusion.analysis.smart_selector import AIFusionSmartSelector
 
 

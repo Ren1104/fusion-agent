@@ -257,12 +257,3 @@ async def get_available_models_v2():
         # 降级到旧版本
         print("⚠️ 使用传统模型发现方式")
         return get_available_models()
-
-
-if __name__ == "__main__":
-    # 运行环境验证和模型测试
-    if validate_environment():
-        print("\n🧪 运行模型连接测试...")
-        asyncio.run(test_all_models())
-    else:
-        setup_example_env()

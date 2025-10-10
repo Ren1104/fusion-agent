@@ -3,7 +3,7 @@ AI Fusion 工具模块
 Utility modules for helper functions
 """
 
-from ai_fusion.utils.helpers import (
+from ai_fusion.utils.utils import (
     ModelConfig,
     get_available_models,
     call_llm_async,
