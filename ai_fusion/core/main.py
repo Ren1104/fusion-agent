@@ -4,13 +4,8 @@ AI Fusion - 基于PocketFlow实现的智能模型融合系统
 """
 
 import asyncio
-import sys
-import os
 
-# 添加PocketFlow路径
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../PocketFlow'))
-
-from pocketflow import AsyncNode, AsyncFlow, AsyncParallelBatchNode
+from pocketflow import AsyncFlow
 from ai_fusion.core.nodes import ModelSelectorNode, ParallelLLMNode, FusionAgentNode
 from ai_fusion.utils.helpers import get_available_models, validate_environment
 from ai_fusion.reporting.reporter import AIFusionReporter
