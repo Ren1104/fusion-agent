@@ -399,6 +399,126 @@ class FusionAgentNode(AsyncNode):
         if exec_res:
             shared["final_answer"] = exec_res
             print("✅ 回答融合完成！")
-            return "complete"
+            return "analyze"  # 继续到质量分析节点
+
+        return None
+
+
+class QualityAnalyzerNode(AsyncNode):
+    """
+    质量分析节点
+    对融合回答和各模型回答进行质量分析
+    """
+
+    def __init__(self):
+        super().__init__(max_retries=2, wait=1)
+        from ai_fusion.analysis.quality_analyzer import AIFusionQualityAnalyzer
+        self.analyzer = AIFusionQualityAnalyzer()
+
+    async def prep_async(self, shared):
+        """准备阶段：获取问题、回答和融合结果"""
+        question = shared.get("user_question", "")
+        llm_responses = shared.get("llm_responses", [])
+        final_answer = shared.get("final_answer", "")
+
+        if not question:
+            raise ValueError("用户问题不能为空")
+
+        if not llm_responses:
+            print("⚠️ 没有LLM回答，跳过质量分析")
+            return None
+
+        return {
+            "question": question,
+            "llm_responses": llm_responses,
+            "final_answer": final_answer
+        }
+
+    async def exec_async(self, inputs):
+        """执行阶段：进行质量分析"""
+        if inputs is None:
+            return None
+
+        print("\n🔍 正在进行质量分析...")
+
+        quality_analysis = await self.analyzer.analyze_quality(
+            question=inputs["question"],
+            llm_responses=inputs["llm_responses"],
+            fusion_answer=inputs["final_answer"]
+        )
+
+        return quality_analysis
+
+    async def post_async(self, shared, prep_res, exec_res):
+        """后处理阶段：保存质量分析结果"""
+        if exec_res:
+            shared["quality_analysis"] = exec_res
+            print("✅ 质量分析完成！")
+            return "report"  # 继续到报告生成节点
+        else:
+            # 如果没有分析结果，直接跳到报告节点
+            return "report"
+
+
+class ReportGeneratorNode(AsyncNode):
+    """
+    报告生成节点
+    生成详细的Markdown分析报告
+    """
+
+    def __init__(self):
+        super().__init__(max_retries=1, wait=1)
+        from ai_fusion.reporting.reporter import AIFusionReporter
+        self.reporter = AIFusionReporter()
+
+    async def prep_async(self, shared):
+        """准备阶段：收集所有必要的数据"""
+        question = shared.get("user_question", "")
+        question_type = shared.get("question_type", "未知")
+        llm_responses = shared.get("llm_responses", [])
+        final_answer = shared.get("final_answer", "")
+        quality_analysis = shared.get("quality_analysis")
+        selection_analysis = shared.get("selection_analysis", {})
+        selected_models = shared.get("selected_models", [])
+
+        return {
+            "question": question,
+            "question_type": question_type,
+            "llm_responses": llm_responses,
+            "final_answer": final_answer,
+            "selected_models": [m.name for m in selected_models],
+            "quality_analysis": quality_analysis,
+            "selection_analysis": selection_analysis
+        }
+
+    async def exec_async(self, inputs):
+        """执行阶段：生成报告"""
+        # 打印简要摘要
+        if inputs["quality_analysis"]:
+            self.reporter.print_summary(
+                inputs["llm_responses"],
+                inputs["final_answer"],
+                inputs["quality_analysis"]
+            )
+
+        # 生成详细报告
+        report_path = self.reporter.generate_report(
+            question=inputs["question"],
+            question_type=inputs["question_type"],
+            llm_responses=inputs["llm_responses"],
+            final_answer=inputs["final_answer"],
+            selected_models=inputs["selected_models"],
+            quality_analysis=inputs["quality_analysis"],
+            selection_analysis=inputs["selection_analysis"]
+        )
+
+        return report_path
+
+    async def post_async(self, shared, prep_res, exec_res):
+        """后处理阶段：保存报告路径"""
+        if exec_res:
+            shared["report_path"] = exec_res
+            print(f"✅ 报告已生成: {exec_res}")
+            return "complete"  # 流程结束
 
         return None
