@@ -7,7 +7,7 @@ import json
 import re
 import asyncio
 import hashlib
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
 
@@ -688,6 +688,7 @@ class QualityMetrics:
     relevance_score: float     # 相关性评分 (0-10)
     overall_score: float       # 综合评分 (0-10)
     word_count: int           # 词数
+    char_count: int           # 字符数
     sentence_count: int       # 句数
     readability_score: float  # 可读性评分 (0-10)
     information_density: float # 信息密度 (0-10)
@@ -698,9 +699,17 @@ class AIFusionQualityAnalyzer:
 
     def __init__(self, registry=None):
         self.evaluator_model = "claude_sonnet4"  # 用于评估的模型
+        self.evaluator_candidates = [
+            "claude_sonnet4",
+            "gpt-41-0414-global",
+            "claude37_sonnet_new",
+            "qwen-max"
+        ]
         self.registry = registry  # ModelRegistry 实例
         self._current_trace_id: Optional[str] = None
         self._current_parent_observation_id: Optional[str] = None
+        self._resolved_evaluator_model: Optional[str] = None
+        self._evaluation_cache: Dict[str, Dict[str, Tuple[QualityMetrics, Dict[str, Any]]]] = {}
     
     async def analyze_quality(
         self,
@@ -725,6 +734,7 @@ class AIFusionQualityAnalyzer:
 
         self._current_trace_id = trace_id
         self._current_parent_observation_id = parent_observation_id
+        await self._ensure_evaluator_model()
 
         try:
             # 1. 计算基础指标
@@ -739,7 +749,7 @@ class AIFusionQualityAnalyzer:
             basic_metrics['fusion_answer'] = self._calculate_basic_metrics(fusion_answer)
 
             # 2. LLM评估（异步并发）
-            llm_evaluations = await self._evaluate_with_llm(
+            llm_evaluations, evaluation_details = await self._evaluate_with_llm(
                 question, llm_responses, fusion_answer
             )
 
@@ -776,6 +786,7 @@ class AIFusionQualityAnalyzer:
             return {
                 'basic_metrics': basic_metrics,
                 'llm_evaluations': llm_evaluations,
+                'llm_evaluation_details': evaluation_details,
                 'content_analysis': content_analysis,
                 'comparison_analysis': comparison_analysis,
                 'consistency_check': consistency_check,
@@ -788,39 +799,92 @@ class AIFusionQualityAnalyzer:
             self._current_trace_id = None
             self._current_parent_observation_id = None
     
+    def _extract_text_statistics(self, text: str) -> Dict[str, Any]:
+        """提取文本统计信息，兼顾中英文场景"""
+        content = text.strip()
+        if not content:
+            return {
+                "word_count": 0,
+                "char_count": 0,
+                "sentence_count": 0,
+                "readability": 0.0,
+                "information_density": 0.0
+            }
+
+        char_count = len(content)
+
+        # 句子拆分：处理中英文标点
+        sentence_splits = re.split(r'[。！？!?]+|(?<=[.!?])\s+', content)
+        sentences = [s.strip() for s in sentence_splits if s and s.strip()]
+        sentence_count = len(sentences) or 1
+
+        # 词语抽取：单字中文 + 英文/数字词
+        token_pattern = re.compile(r'[\u4e00-\u9fff]|[A-Za-z]+(?:\'[A-Za-z]+)?|[0-9]+')
+        tokens = token_pattern.findall(content)
+        word_count = len(tokens)
+        unique_tokens = len({token.lower() for token in tokens}) if tokens else 0
+
+        avg_sentence_len = word_count / sentence_count if sentence_count else 0.0
+        avg_word_len = (sum(len(token) for token in tokens) / word_count) if word_count else 0.0
+
+        # 可读性：句长、词长越大可读性越低
+        readability = 10.0
+        if avg_sentence_len > 22:
+            readability -= (avg_sentence_len - 22) * 0.35
+        elif avg_sentence_len < 12:
+            readability += min(1.5, (12 - avg_sentence_len) * 0.1)
+
+        if avg_word_len > 4.5:
+            readability -= (avg_word_len - 4.5) * 1.2
+        elif avg_word_len < 3:
+            readability += min(1.0, (3 - avg_word_len) * 0.3)
+
+        readability = max(0.0, min(10.0, readability))
+
+        lexical_diversity = (unique_tokens / word_count) if word_count else 0.0
+        information_density = max(0.0, min(10.0, lexical_diversity * 12.0))
+
+        return {
+            "word_count": word_count,
+            "char_count": char_count,
+            "sentence_count": sentence_count,
+            "readability": readability,
+            "information_density": information_density
+        }
+
+    def _build_comparison_excerpt(self, text: str, max_chars: int = 420) -> Tuple[str, Dict[str, Any]]:
+        """生成对比评分使用的摘要片段，同时返回基础统计信息"""
+        stats = self._extract_text_statistics(text)
+        total_chars = stats["char_count"]
+
+        if total_chars <= max_chars:
+            return text, stats
+
+        head_len = max_chars - 160
+        head = text[:max(80, head_len)].strip()
+        tail = text[-120:].strip()
+
+        excerpt = f"{head}\n...\n{tail}"
+        return excerpt, stats
+
     def _calculate_basic_metrics(self, text: str) -> QualityMetrics:
         """计算基础质量指标"""
         if not text:
-            return QualityMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0)
-        
-        # 字符数统计（更准确的中文文本长度计算）
-        char_count = len(text)
-        # 中文词汇统计（按字符和空格分割）
-        words = re.findall(r'[\w\u4e00-\u9fff]+', text)
-        word_count = len(words)
-        # 句子统计（改进的分句逻辑）
-        sentences = re.split(r'[.!?。！？]+', text)
-        sentence_count = len([s for s in sentences if s.strip()])
-        
-        # 可读性评分（基于平均句长）
-        avg_sentence_length = word_count / max(sentence_count, 1)
-        readability_score = max(0, min(10, 10 - (avg_sentence_length - 15) * 0.2))
-        
-        # 信息密度（基于内容多样性）
-        unique_words = len(set(text.lower().split()))
-        information_density = min(10, (unique_words / max(word_count, 1)) * 20)
-        
-        # 基础评分（会在LLM评估中更新）
+            return QualityMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        stats = self._extract_text_statistics(text)
+
         return QualityMetrics(
             completeness_score=0,  # 待LLM评估
             accuracy_score=0,      # 待LLM评估
-            clarity_score=readability_score,
+            clarity_score=stats["readability"],
             relevance_score=0,     # 待LLM评估
             overall_score=0,       # 待计算
-            word_count=char_count,  # 使用字符数而非词数
-            sentence_count=sentence_count,
-            readability_score=readability_score,
-            information_density=information_density
+            word_count=stats["word_count"],
+            char_count=stats["char_count"],
+            sentence_count=stats["sentence_count"],
+            readability_score=stats["readability"],
+            information_density=stats["information_density"]
         )
     
     async def _evaluate_with_llm(
@@ -828,57 +892,70 @@ class AIFusionQualityAnalyzer:
         question: str,
         llm_responses: List[Dict],
         fusion_answer: str
-    ) -> Dict[str, QualityMetrics]:
+    ) -> Tuple[Dict[str, QualityMetrics], Dict[str, Dict[str, Any]]]:
         """使用LLM评估回答质量（采用对比评分机制）"""
 
         # 准备评估任务
         answer_sources = {}
 
-        # 收集所有成功的回答
         for response in llm_responses:
             if response['success']:
                 answer_sources[response['model_name']] = response['response']
 
-        # 添加融合回答
         answer_sources['fusion_answer'] = fusion_answer
 
-        # **第一阶段：批量对比评分（新增）**
-        # 这会让评估器一次性看到所有回答，从而给出相对评分
         comparative_scores = await self._comparative_batch_evaluation(
             question, answer_sources
         )
 
-        # **第二阶段：单独评估（保留原有详细评估）**
+        llm_evaluations: Dict[str, QualityMetrics] = {}
+        evaluation_details: Dict[str, Dict[str, Any]] = {}
+
         evaluation_tasks = []
-        source_names = []
+        pending_sources: List[str] = []
+        pending_hashes: Dict[str, str] = {}
 
         for source_name, answer_text in answer_sources.items():
-            # 传入对比评分作为参考
             base_score = comparative_scores.get(source_name, 7.0)
-            evaluation_tasks.append(
-                self._evaluate_single_answer(
-                    question,
-                    answer_text,
-                    source_name,
-                    base_reference_score=base_score  # 传入参考分
-                )
-            )
-            source_names.append(source_name)
+            answer_hash = hashlib.sha256(answer_text.encode('utf-8')).hexdigest()
+            cache_bucket = self._evaluation_cache.setdefault(source_name, {})
 
-        # 并发执行详细评估
-        evaluation_results = await asyncio.gather(*evaluation_tasks, return_exceptions=True)
-
-        # 整理结果
-        llm_evaluations = {}
-        for i, source_name in enumerate(source_names):
-            if i < len(evaluation_results) and not isinstance(evaluation_results[i], Exception):
-                llm_evaluations[source_name] = evaluation_results[i]
+            if answer_hash in cache_bucket:
+                cached_metrics, cached_details = cache_bucket[answer_hash]
+                llm_evaluations[source_name] = cached_metrics
+                evaluation_details[source_name] = cached_details
             else:
-                # 如果评估失败，使用默认值
-                print(f"⚠️ {source_name} 评估失败，使用默认值")
-                llm_evaluations[source_name] = QualityMetrics(5, 5, 5, 5, 5, 0, 0, 5, 5)
+                evaluation_tasks.append(
+                    self._evaluate_single_answer(
+                        question,
+                        answer_text,
+                        source_name,
+                        base_reference_score=base_score
+                    )
+                )
+                pending_sources.append(source_name)
+                pending_hashes[source_name] = answer_hash
 
-        return llm_evaluations
+        if evaluation_tasks:
+            evaluation_results = await asyncio.gather(*evaluation_tasks, return_exceptions=True)
+
+            for i, source_name in enumerate(pending_sources):
+                if i < len(evaluation_results) and not isinstance(evaluation_results[i], Exception):
+                    metrics, details = evaluation_results[i]
+                    llm_evaluations[source_name] = metrics
+                    evaluation_details[source_name] = details
+                    cached = self._evaluation_cache.setdefault(source_name, {})
+                    cached[pending_hashes[source_name]] = (metrics, details)
+                else:
+                    print(f"⚠️ {source_name} 评估失败，使用默认值")
+                    default_metrics = QualityMetrics(5, 5, 5, 5, 5, 0, 0, 0, 5, 5)
+                    default_details = self._default_evaluation_details()
+                    llm_evaluations[source_name] = default_metrics
+                    evaluation_details[source_name] = default_details
+                    cached = self._evaluation_cache.setdefault(source_name, {})
+                    cached[pending_hashes[source_name]] = (default_metrics, default_details)
+
+        return llm_evaluations, evaluation_details
 
     async def _comparative_batch_evaluation(
         self,
@@ -890,6 +967,7 @@ class AIFusionQualityAnalyzer:
         这能确保评分的区分度和一致性
         """
         print("🔍 正在进行批量对比评分...")
+        evaluator_model = await self._ensure_evaluator_model()
 
         # 构建对比评分prompt
         comparative_prompt = f"""
@@ -902,11 +980,10 @@ class AIFusionQualityAnalyzer:
 """
 
         for i, (source_name, answer_text) in enumerate(answer_sources.items(), 1):
-            # 限制每个回答的长度以避免prompt过长
-            truncated_answer = answer_text[:500] + "..." if len(answer_text) > 500 else answer_text
+            excerpt, stats = self._build_comparison_excerpt(answer_text)
             comparative_prompt += f"""
-【回答{i}: {source_name}】
-{truncated_answer}
+【回答{i}: {source_name} | 长度 {stats['char_count']} 字符，句数 {stats['sentence_count']}】
+{excerpt}
 
 """
 
@@ -940,8 +1017,8 @@ class AIFusionQualityAnalyzer:
         try:
             response = await call_llm_async(
                 messages=[{"role": "user", "content": comparative_prompt}],
-                model=self.evaluator_model,
-                max_tokens=1000,
+                model=evaluator_model,
+                max_tokens=800,
                 temperature=0.2,
                 registry=self.registry,
                 trace_id=self._current_trace_id,
@@ -1078,10 +1155,11 @@ class AIFusionQualityAnalyzer:
         try:
             print(f"🤖 正在评估 {source_name} 的回答质量...")
 
+            evaluator_model = await self._ensure_evaluator_model()
             response = await call_llm_async(
                 messages=[{"role": "user", "content": evaluation_prompt}],
-                model=self.evaluator_model,
-                max_tokens=2000,  # 增加token数以容纳详细的评分依据
+                model=evaluator_model,
+                max_tokens=1500,  # 控制token以平衡成本
                 temperature=0.2,   # 降低温度以提高评分一致性
                 registry=self.registry,
                 trace_id=self._current_trace_id,
@@ -1093,49 +1171,53 @@ class AIFusionQualityAnalyzer:
                 },
             )
             
-            # 解析评分结果
+            # 解析评分结果与详细说明
             scores = self._parse_evaluation_response(response)
+            details = self._parse_evaluation_details(response)
 
-            # 计算准确的字符数和句子数
-            char_count = len(answer)
-            words = re.findall(r'[\w\u4e00-\u9fff]+', answer)
-            word_count = len(words)
-            sentences = re.split(r'[.!?。！？]+', answer)
-            sentence_count = len([s for s in sentences if s.strip()])
+            # 计算文本统计
+            stats = self._extract_text_statistics(answer)
 
             # **关键修复：使用对比评分作为基准，只允许小幅调整**
             # 这样可以保持对比评分的区分度，同时允许细微的维度差异
 
-            completeness = scores.get('completeness', base_reference_score)
-            accuracy = scores.get('accuracy', base_reference_score)
-            clarity = scores.get('clarity', base_reference_score)
-            relevance = scores.get('relevance', base_reference_score)
+            completeness = self._harmonize_dimension_score(
+                base_reference_score, scores.get('completeness', base_reference_score)
+            )
+            accuracy = self._harmonize_dimension_score(
+                base_reference_score, scores.get('accuracy', base_reference_score)
+            )
+            clarity = self._harmonize_dimension_score(
+                base_reference_score, scores.get('clarity', base_reference_score)
+            )
+            relevance = self._harmonize_dimension_score(
+                base_reference_score, scores.get('relevance', base_reference_score)
+            )
 
-            # 各维度评分不能偏离对比评分太多（±1.0分以内）
-            completeness = max(base_reference_score - 1.0, min(base_reference_score + 1.0, completeness))
-            accuracy = max(base_reference_score - 1.0, min(base_reference_score + 1.0, accuracy))
-            clarity = max(base_reference_score - 1.0, min(base_reference_score + 1.0, clarity))
-            relevance = max(base_reference_score - 1.0, min(base_reference_score + 1.0, relevance))
-
-            # 综合评分必须接近对比评分
             dimension_avg = (completeness + accuracy + clarity + relevance) / 4
-            overall = (base_reference_score * 0.7 + dimension_avg * 0.3)  # 70%权重来自对比评分
+            overall_from_model = self._harmonize_dimension_score(
+                base_reference_score, scores.get('overall', dimension_avg)
+            )
+            overall = max(0.0, min(10.0, dimension_avg * 0.6 + overall_from_model * 0.4))
+            overall = round(overall, 1)
 
-            return QualityMetrics(
+            metrics = QualityMetrics(
                 completeness_score=round(completeness, 1),
                 accuracy_score=round(accuracy, 1),
                 clarity_score=round(clarity, 1),
                 relevance_score=round(relevance, 1),
                 overall_score=round(overall, 1),
-                word_count=char_count,  # 使用字符数
-                sentence_count=sentence_count,
-                readability_score=scores.get('clarity', 5.0),
-                information_density=min(10, len(set([w.lower() for w in words])) / max(word_count, 1) * 20)
+                word_count=stats["word_count"],
+                char_count=stats["char_count"],
+                sentence_count=stats["sentence_count"],
+                readability_score=stats["readability"],
+                information_density=stats["information_density"]
             )
+            return metrics, details
             
         except Exception as e:
             print(f"⚠️ 评估 {source_name} 时出错: {str(e)}")
-            return QualityMetrics(5, 5, 5, 5, 5, 0, 0, 5, 5)
+            return QualityMetrics(5, 5, 5, 5, 5, 0, 0, 0, 5, 5), self._default_evaluation_details()
     
     def _parse_evaluation_response(self, response: str) -> Dict[str, float]:
         """解析LLM评估响应"""
@@ -1161,6 +1243,96 @@ class AIFusionQualityAnalyzer:
                 scores[key] = 5.0
         
         return scores
+
+    def _default_evaluation_details(self) -> Dict[str, Any]:
+        """默认的评估详情结构"""
+        return {
+            'completeness': {'strengths': [], 'weaknesses': []},
+            'accuracy': {'strengths': [], 'weaknesses': []},
+            'clarity': {'strengths': [], 'weaknesses': []},
+            'relevance': {'strengths': [], 'weaknesses': []},
+            'unique_characteristics': "",
+            'core_suggestions': []
+        }
+
+    def _parse_evaluation_details(self, response: str) -> Dict[str, Any]:
+        """解析LLM返回的评估细节（优缺点、建议等）"""
+        details = self._default_evaluation_details()
+
+        section_map = {
+            'completeness': '完整性',
+            'accuracy': '准确性',
+            'clarity': '清晰度',
+            'relevance': '相关性'
+        }
+
+        for key, label in section_map.items():
+            pattern = rf"【{label}】\s*✅ 优点:\s*(.*?)\s*❌ 不足:\s*(.*?)(?=\n\s*【|\n\s*\*\*|$)"
+            match = re.search(pattern, response, re.S)
+            if match:
+                strengths_text = match.group(1).strip()
+                weaknesses_text = match.group(2).strip()
+                details[key]['strengths'] = self._normalize_insight_items(strengths_text)
+                details[key]['weaknesses'] = self._normalize_insight_items(weaknesses_text)
+
+        unique_match = re.search(r"\*\*独特特征：\*\*\s*(.*?)(?=\n\s*\*\*|$)", response, re.S)
+        if unique_match:
+            details['unique_characteristics'] = self._clean_text_block(unique_match.group(1))
+
+        suggestion_match = re.search(r"\*\*核心建议：\*\*\s*(.*)", response, re.S)
+        if suggestion_match:
+            suggestions_block = suggestion_match.group(1)
+            details['core_suggestions'] = self._normalize_suggestions(suggestions_block)
+
+        return details
+
+    def _normalize_insight_items(self, text: str) -> List[str]:
+        """将优点/不足文本拆分成列表"""
+        if not text:
+            return []
+
+        cleaned = text.strip()
+        cleaned = re.sub(r'^\*+\s*', '', cleaned)
+
+        segments = re.split(r'[\n；;]+', cleaned)
+        items = []
+        for segment in segments:
+            item = segment.strip().strip('-•*')
+            if item:
+                items.append(item)
+        return items
+
+    def _normalize_suggestions(self, text: str) -> List[str]:
+        """解析核心建议为列表"""
+        if not text:
+            return []
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        suggestions = []
+        for line in lines:
+            cleaned = re.sub(r'^[\d\.\-\*、]+\s*', '', line)
+            if cleaned:
+                suggestions.append(cleaned.strip())
+        return suggestions
+
+    def _clean_text_block(self, text: str) -> str:
+        """清洗多行文本为紧凑段落"""
+        if not text:
+            return ""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return " ".join(lines)
+
+    def _harmonize_dimension_score(self, base_reference: float, dimension_score: float) -> float:
+        """结合对比基准与维度打分，保留差异同时避免极端值"""
+        if dimension_score is None:
+            return round(max(0.0, min(10.0, base_reference)), 1)
+
+        allowed_spread = 2.5
+        delta = dimension_score - base_reference
+        limited = base_reference + max(-allowed_spread, min(allowed_spread, delta))
+
+        blended = limited * 0.75 + base_reference * 0.25
+        return round(max(0.0, min(10.0, blended)), 1)
     
     async def _perform_content_semantic_analysis(
         self,
@@ -1323,6 +1495,7 @@ class AIFusionQualityAnalyzer:
                 'clarity': evaluation.clarity_score,
                 'relevance': evaluation.relevance_score,
                 'word_count': basic.word_count if basic else 0,
+                'char_count': basic.char_count if basic else 0,
                 'is_fusion': source_name == 'fusion_answer'
             })
         
@@ -1381,15 +1554,15 @@ class AIFusionQualityAnalyzer:
                 model_strengths.append("综合表现优秀")
             
             # 特色分析
-            if eval_result.word_count > 0:
+            if eval_result.char_count > 0:
                 # 内容丰富度分析
                 if eval_result.information_density >= 8.0:
                     model_strengths.append("信息密度高")
                 
                 # 回答风格分析
-                if eval_result.word_count > 300:
+                if eval_result.char_count > 600:
                     model_strengths.append("回答详尽")
-                elif eval_result.word_count < 100:
+                elif eval_result.char_count < 200:
                     model_strengths.append("回答简洁")
             
             if model_strengths:
@@ -1624,8 +1797,8 @@ class AIFusionQualityAnalyzer:
                 analysis['relative_ranking'][dimension] = f"{rank}/{len(models_list)}"
             
             # 风格特征分析（个性化）
-            if basic_metric and basic_metric.word_count > 0:
-                char_count = basic_metric.word_count  # 字符数
+            if basic_metric and basic_metric.char_count > 0:
+                char_count = basic_metric.char_count
                 
                 # 更精细的内容特征分析
                 if char_count > 500:
@@ -1849,10 +2022,11 @@ class AIFusionQualityAnalyzer:
 - ✅ 必须给出个性化的场景推荐，不能通用化
 """
 
+            evaluator_model = await self._ensure_evaluator_model()
             response = await call_llm_async(
                 messages=[{"role": "user", "content": individualization_prompt}],
-                model=self.evaluator_model,
-                max_tokens=2500,  # 增加token数以支持详细分析
+                model=evaluator_model,
+                max_tokens=1800,  # 控制token数以支持详细分析
                 temperature=0.4,   # 适当提高温度以增加多样性
                 registry=self.registry,
                 trace_id=self._current_trace_id,
@@ -1924,10 +2098,11 @@ class AIFusionQualityAnalyzer:
 }}
 """
 
+            evaluator_model = await self._ensure_evaluator_model()
             response = await call_llm_async(
                 messages=[{"role": "user", "content": analysis_prompt}],
-                model=self.evaluator_model,
-                max_tokens=1000,
+                model=evaluator_model,
+                max_tokens=700,
                 temperature=0.3,
                 registry=self.registry,
                 trace_id=self._current_trace_id,
@@ -2033,10 +2208,11 @@ class AIFusionQualityAnalyzer:
 }}
 """
             
+            evaluator_model = await self._ensure_evaluator_model()
             response = await call_llm_async(
                 messages=[{"role": "user", "content": themes_prompt}],
-                model=self.evaluator_model,
-                max_tokens=800,
+                model=evaluator_model,
+                max_tokens=700,
                 temperature=0.3,
                 registry=self.registry,
                 trace_id=self._current_trace_id,
@@ -2417,6 +2593,7 @@ class AIFusionQualityAnalyzer:
                         relevance_score=original.relevance_score,
                         overall_score=correction_value,  # 应用校正值
                         word_count=original.word_count,
+                        char_count=original.char_count,
                         sentence_count=original.sentence_count,
                         readability_score=original.readability_score,
                         information_density=original.information_density
@@ -3159,3 +3336,23 @@ class AIFusionQualityAnalyzer:
             'individual_tradeoffs': assessments,
             'overall_assessment': overall_assessment
         }
+    async def _ensure_evaluator_model(self) -> str:
+        """确保有可用的质量评估模型"""
+        if self._resolved_evaluator_model:
+            return self._resolved_evaluator_model
+
+        resolved = None
+        if self.registry:
+            try:
+                models = await self.registry.discover_all_models()
+                available_ids = {model.model_id for model in models}
+                for candidate in self.evaluator_candidates:
+                    if candidate in available_ids:
+                        resolved = candidate
+                        break
+            except Exception as exc:
+                print(f"⚠️ 评估模型可用性检测失败: {exc}")
+
+        self._resolved_evaluator_model = resolved or self.evaluator_model
+        print(f"🧪 使用质量评估模型: {self._resolved_evaluator_model}")
+        return self._resolved_evaluator_model
