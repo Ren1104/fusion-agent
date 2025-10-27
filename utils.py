@@ -87,12 +87,13 @@ async def call_llm_async(
     try:
         registry = get_model_registry()
         if registry:
-            return await registry.call_model(
+            response = await registry.call_model(
                 model_id=model,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature
             )
+            return response.text
     except Exception as e:
         print(f"⚠️ ModelRegistry 调用失败，回退到传统方式: {str(e)}")
 
@@ -224,19 +225,10 @@ def get_model_registry():
         models = await registry.discover_all_models()
     """
     try:
-        from registry import ModelRegistry
-        from providers import UniversalProvider, ProviderConfig
+        from providers import ModelRegistry
 
-        # 创建自定义配置，使用 UniversalProvider
-        custom_providers = {
-            "universal": ProviderConfig(
-                provider_class=UniversalProvider,
-                api_key_env="OPENAI_API_KEY",
-                base_url_env="OPENAI_BASE_URL"
-            )
-        }
-
-        return ModelRegistry(custom_providers=custom_providers)
+        # 使用默认配置创建 ModelRegistry
+        return ModelRegistry()
     except ImportError:
         print("⚠️ ModelRegistry 功能不可用，请确保已安装所有依赖")
         return None

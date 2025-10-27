@@ -30,15 +30,55 @@ class ModelConfig:
 # LLM 调用函数(兼容旧代码)
 # ============================================
 
-async def call_llm_async(messages, model, max_tokens=2000, temperature=0.7, **kwargs):
+async def call_llm_async(
+    messages,
+    model,
+    max_tokens=2000,
+    temperature=0.7,
+    registry=None,
+    trace_id=None,
+    return_response_obj: bool = False,
+    parent_observation_id: Optional[str] = None,
+    langfuse_metadata: Optional[Dict[str, Any]] = None,
+    **kwargs
+):
     """
     兼容的 LLM 调用函数
     实际调用 providers.ModelRegistry
+
+    Args:
+        messages: 消息列表
+        model: 模型ID
+        max_tokens: 最大token数
+        temperature: 温度参数
+        registry: ModelRegistry 实例 (可选，如果不提供会创建新实例)
+        trace_id: Langfuse trace ID (可选)
+        return_response_obj: 是否返回完整响应对象（包含 usage 等信息）
+        parent_observation_id: Langfuse 父 span ID
+        langfuse_metadata: 附加的 Langfuse 元数据
+        **kwargs: 其他参数
     """
     from providers import ModelRegistry
-    registry = ModelRegistry()
-    await registry.discover_all_models()
-    return await registry.call_model(model, messages, max_tokens=max_tokens, temperature=temperature)
+
+    # 如果没有提供 registry，创建一个新的（向后兼容）
+    if registry is None:
+        registry = ModelRegistry()
+        await registry.discover_all_models()
+
+    response = await registry.call_model(
+        model,
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        trace_id=trace_id,
+        parent_observation_id=parent_observation_id,
+        langfuse_metadata=langfuse_metadata,
+        **kwargs
+    )
+
+    if return_response_obj:
+        return response
+    return response.text
 
 
 
@@ -63,10 +103,11 @@ class ModelCapability:
 
 class AIFusionSmartSelector:
     """AI Fusion智能模型选择器"""
-    
-    def __init__(self):
+
+    def __init__(self, registry=None):
         self.analyzer_model = "claude_sonnet4"  # 用于分析的模型
         self.model_knowledge = self._build_model_knowledge()
+        self.registry = registry  # ModelRegistry 实例
     
     def _build_model_knowledge(self) -> Dict[str, ModelCapability]:
         """构建模型知识库 - 包含所有可用模型的详细能力描述"""
@@ -379,9 +420,11 @@ class AIFusionSmartSelector:
         }
     
     async def intelligent_model_selection(
-        self, 
-        question: str, 
-        available_models: List[ModelConfig]
+        self,
+        question: str,
+        available_models: List[ModelConfig],
+        trace_id: Optional[str] = None,
+        parent_observation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         智能模型选择
@@ -407,7 +450,14 @@ class AIFusionSmartSelector:
                 messages=[{"role": "user", "content": analysis_prompt}],
                 model=self.analyzer_model,
                 max_tokens=1500,
-                temperature=0.3
+                temperature=0.3,
+                registry=self.registry,  # 传递 registry
+                trace_id=trace_id,
+                parent_observation_id=parent_observation_id,
+                langfuse_metadata={
+                    "component": "model_selector",
+                    "stage": "intelligent_selection"
+                },
             )
             
             # 4. 解析推荐结果
@@ -645,15 +695,20 @@ class QualityMetrics:
 
 class AIFusionQualityAnalyzer:
     """AI Fusion质量分析器"""
-    
-    def __init__(self):
+
+    def __init__(self, registry=None):
         self.evaluator_model = "claude_sonnet4"  # 用于评估的模型
+        self.registry = registry  # ModelRegistry 实例
+        self._current_trace_id: Optional[str] = None
+        self._current_parent_observation_id: Optional[str] = None
     
     async def analyze_quality(
-        self, 
+        self,
         question: str,
         llm_responses: List[Dict],
-        fusion_answer: str
+        fusion_answer: str,
+        trace_id: Optional[str] = None,
+        parent_observation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         分析回答质量
@@ -667,63 +722,71 @@ class AIFusionQualityAnalyzer:
             质量分析结果
         """
         print("🔍 开始质量分析...")
-        
-        # 1. 计算基础指标
-        basic_metrics = {}
-        for response in llm_responses:
-            if response['success']:
-                basic_metrics[response['model_name']] = self._calculate_basic_metrics(
-                    response['response']
-                )
-        
-        # 融合回答的基础指标
-        basic_metrics['fusion_answer'] = self._calculate_basic_metrics(fusion_answer)
-        
-        # 2. LLM评估（异步并发）
-        llm_evaluations = await self._evaluate_with_llm(
-            question, llm_responses, fusion_answer
-        )
-        
-        # 3. 内容语义分析（增强差异化能力）
-        content_analysis = await self._perform_content_semantic_analysis(
-            question, llm_responses, fusion_answer
-        )
-        
-        # 4. 对比分析（增强）
-        comparison_analysis = self._perform_enhanced_comparison_analysis(
-            basic_metrics, llm_evaluations, content_analysis
-        )
-        
-        # 5. 逻辑一致性验证
-        consistency_check = self._perform_consistency_validation(
-            llm_evaluations, comparison_analysis, content_analysis
-        )
-        
-        # 6. 质量排名（经过一致性校正）
-        quality_ranking = self._calculate_validated_quality_ranking(
-            basic_metrics, llm_evaluations, consistency_check
-        )
 
-        # 7. 融合效果量化分析（新增）
-        fusion_effectiveness = self._analyze_fusion_effectiveness(
-            llm_evaluations, comparison_analysis, content_analysis
-        )
+        self._current_trace_id = trace_id
+        self._current_parent_observation_id = parent_observation_id
 
-        # 8. 速度-质量权衡分析（新增）
-        speed_quality_tradeoff = self._analyze_speed_quality_tradeoff(
-            llm_responses, llm_evaluations
-        )
+        try:
+            # 1. 计算基础指标
+            basic_metrics = {}
+            for response in llm_responses:
+                if response['success']:
+                    basic_metrics[response['model_name']] = self._calculate_basic_metrics(
+                        response['response']
+                    )
 
-        return {
-            'basic_metrics': basic_metrics,
-            'llm_evaluations': llm_evaluations,
-            'content_analysis': content_analysis,
-            'comparison_analysis': comparison_analysis,
-            'consistency_check': consistency_check,
-            'quality_ranking': quality_ranking,
-            'fusion_effectiveness': fusion_effectiveness,  # 新增融合效果分析
-            'speed_quality_tradeoff': speed_quality_tradeoff  # 新增速度质量权衡分析
-        }
+            # 融合回答的基础指标
+            basic_metrics['fusion_answer'] = self._calculate_basic_metrics(fusion_answer)
+
+            # 2. LLM评估（异步并发）
+            llm_evaluations = await self._evaluate_with_llm(
+                question, llm_responses, fusion_answer
+            )
+
+            # 3. 内容语义分析（增强差异化能力）
+            content_analysis = await self._perform_content_semantic_analysis(
+                question, llm_responses, fusion_answer
+            )
+
+            # 4. 对比分析（增强）
+            comparison_analysis = self._perform_enhanced_comparison_analysis(
+                basic_metrics, llm_evaluations, content_analysis
+            )
+
+            # 5. 逻辑一致性验证
+            consistency_check = self._perform_consistency_validation(
+                llm_evaluations, comparison_analysis, content_analysis
+            )
+
+            # 6. 质量排名（经过一致性校正）
+            quality_ranking = self._calculate_validated_quality_ranking(
+                basic_metrics, llm_evaluations, consistency_check
+            )
+
+            # 7. 融合效果量化分析（新增）
+            fusion_effectiveness = self._analyze_fusion_effectiveness(
+                llm_evaluations, comparison_analysis, content_analysis
+            )
+
+            # 8. 速度-质量权衡分析（新增）
+            speed_quality_tradeoff = self._analyze_speed_quality_tradeoff(
+                llm_responses, llm_evaluations
+            )
+
+            return {
+                'basic_metrics': basic_metrics,
+                'llm_evaluations': llm_evaluations,
+                'content_analysis': content_analysis,
+                'comparison_analysis': comparison_analysis,
+                'consistency_check': consistency_check,
+                'quality_ranking': quality_ranking,
+                'fusion_effectiveness': fusion_effectiveness,  # 新增融合效果分析
+                'speed_quality_tradeoff': speed_quality_tradeoff  # 新增速度质量权衡分析
+            }
+        finally:
+            # 清理上下文
+            self._current_trace_id = None
+            self._current_parent_observation_id = None
     
     def _calculate_basic_metrics(self, text: str) -> QualityMetrics:
         """计算基础质量指标"""
@@ -879,7 +942,14 @@ class AIFusionQualityAnalyzer:
                 messages=[{"role": "user", "content": comparative_prompt}],
                 model=self.evaluator_model,
                 max_tokens=1000,
-                temperature=0.2
+                temperature=0.2,
+                registry=self.registry,
+                trace_id=self._current_trace_id,
+                parent_observation_id=self._current_parent_observation_id,
+                langfuse_metadata={
+                    "component": "quality_analyzer",
+                    "stage": "comparative_scoring"
+                },
             )
 
             # 解析对比评分结果
@@ -1012,7 +1082,15 @@ class AIFusionQualityAnalyzer:
                 messages=[{"role": "user", "content": evaluation_prompt}],
                 model=self.evaluator_model,
                 max_tokens=2000,  # 增加token数以容纳详细的评分依据
-                temperature=0.2   # 降低温度以提高评分一致性
+                temperature=0.2,   # 降低温度以提高评分一致性
+                registry=self.registry,
+                trace_id=self._current_trace_id,
+                parent_observation_id=self._current_parent_observation_id,
+                langfuse_metadata={
+                    "component": "quality_analyzer",
+                    "stage": "single_answer_evaluation",
+                    "source": source_name,
+                },
             )
             
             # 解析评分结果
@@ -1775,7 +1853,14 @@ class AIFusionQualityAnalyzer:
                 messages=[{"role": "user", "content": individualization_prompt}],
                 model=self.evaluator_model,
                 max_tokens=2500,  # 增加token数以支持详细分析
-                temperature=0.4   # 适当提高温度以增加多样性
+                temperature=0.4,   # 适当提高温度以增加多样性
+                registry=self.registry,
+                trace_id=self._current_trace_id,
+                parent_observation_id=self._current_parent_observation_id,
+                langfuse_metadata={
+                    "component": "quality_analyzer",
+                    "stage": "individualized_profiles"
+                },
             )
 
             # 解析JSON结果
@@ -1843,7 +1928,14 @@ class AIFusionQualityAnalyzer:
                 messages=[{"role": "user", "content": analysis_prompt}],
                 model=self.evaluator_model,
                 max_tokens=1000,
-                temperature=0.3
+                temperature=0.3,
+                registry=self.registry,
+                trace_id=self._current_trace_id,
+                parent_observation_id=self._current_parent_observation_id,
+                langfuse_metadata={
+                    "component": "quality_analyzer",
+                    "stage": "approach_analysis"
+                },
             )
 
             # 尝试解析JSON
@@ -1945,7 +2037,14 @@ class AIFusionQualityAnalyzer:
                 messages=[{"role": "user", "content": themes_prompt}],
                 model=self.evaluator_model,
                 max_tokens=800,
-                temperature=0.3
+                temperature=0.3,
+                registry=self.registry,
+                trace_id=self._current_trace_id,
+                parent_observation_id=self._current_parent_observation_id,
+                langfuse_metadata={
+                    "component": "quality_analyzer",
+                    "stage": "theme_extraction"
+                },
             )
             
             try:

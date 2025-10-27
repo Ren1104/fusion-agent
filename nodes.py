@@ -5,12 +5,13 @@ AI Fusion 节点实现
 
 import asyncio
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 from pocketflow import AsyncNode
 from analyzer import call_llm_async, ModelConfig, AIFusionSmartSelector, AIFusionQualityAnalyzer
 from reporter import AIFusionReporter
+from langfuse_tracer import create_span, finish_observation
 
 
 class ModelSelectorNode(AsyncNode):
@@ -21,7 +22,7 @@ class ModelSelectorNode(AsyncNode):
 
     def __init__(self):
         super().__init__(max_retries=2, wait=1)
-        self.smart_selector = AIFusionSmartSelector()
+        self.smart_selector = None  # 将在 prep_async 中初始化
         # 保留传统选择策略作为回退
         self.fallback_criteria = {
             "技术/编程": ["gpt-41-0414-global", "claude_sonnet4", "qwen-max"],
@@ -35,9 +36,12 @@ class ModelSelectorNode(AsyncNode):
         }
 
     async def prep_async(self, shared):
-        """准备阶段：获取用户问题和可用模型"""
+        """准备阶段：获取用户问题、可用模型、registry 和 trace_id"""
         question = shared.get("user_question", "")
         available_models = shared.get("available_models", [])
+        registry = shared.get("registry")
+        trace_id = shared.get("trace_id")
+        trace_observation_id = shared.get("langfuse_trace_observation_id")
 
         if not question:
             raise ValueError("用户问题不能为空")
@@ -45,22 +49,45 @@ class ModelSelectorNode(AsyncNode):
         if not available_models:
             raise ValueError("没有可用的模型")
 
+        # 初始化 smart_selector（使用 registry）
+        if self.smart_selector is None:
+            self.smart_selector = AIFusionSmartSelector(registry=registry)
+
         return {
             "question": question,
-            "available_models": available_models
+            "available_models": available_models,
+            "trace_id": trace_id,
+            "trace_observation_id": trace_observation_id
         }
 
     async def exec_async(self, inputs):
         """执行阶段：智能分析问题并选择合适的模型"""
         question = inputs["question"]
         available_models = inputs["available_models"]
+        trace_id = inputs.get("trace_id")
+        parent_observation_id = inputs.get("trace_observation_id")
+
+        selector_span = create_span(
+            trace_id,
+            name="ModelSelector",
+            parent_observation_id=parent_observation_id,
+            input_data={
+                "question": question,
+                "available_models": [model.name for model in available_models],
+            },
+            metadata={"node": "ModelSelector"},
+        )
+        current_parent_id = selector_span.id if selector_span else parent_observation_id
 
         print("🧠 正在进行智能模型选择分析...")
 
         try:
             # 使用智能选择器
             recommendation = await self.smart_selector.intelligent_model_selection(
-                question, available_models
+                question,
+                available_models,
+                trace_id=trace_id,
+                parent_observation_id=current_parent_id,
             )
 
             selected_models = recommendation.get('selected_models', [])
@@ -69,16 +96,49 @@ class ModelSelectorNode(AsyncNode):
             # 显示分析结果
             self._display_selection_analysis(recommendation)
 
-            return {
+            result = {
                 "selected_model_names": selected_models,
                 "question_type": recommendation.get('problem_analysis', {}).get('question_type', '智能分析'),
                 "selection_analysis": recommendation,
                 "analysis_method": analysis_method
             }
 
+            finish_observation(
+                selector_span,
+                output_data={
+                    "selected_model_names": selected_models,
+                    "analysis_method": analysis_method,
+                    "question_type": result["question_type"],
+                },
+                metadata={"node": "ModelSelector"},
+            )
+
+            return result
+
         except Exception as e:
             print(f"⚠️ 智能模型选择失败，使用传统方法: {str(e)}")
-            return await self._fallback_selection(question, available_models)
+            result = await self._fallback_selection(
+                question,
+                available_models,
+                trace_id=trace_id,
+                parent_observation_id=current_parent_id,
+            )
+            finish_observation(
+                selector_span,
+                output_data={
+                    "selected_model_names": result["selected_model_names"],
+                    "analysis_method": result.get("analysis_method"),
+                    "question_type": result.get("question_type"),
+                },
+                metadata={"node": "ModelSelector", "fallback": True},
+                level="WARNING",
+                status_message=str(e),
+            )
+            return result
+        finally:
+            if selector_span:
+                # finish_observation 在 try/except 控制分支里已经调用，这里确保待处理对象已结束
+                pass
 
     def _display_selection_analysis(self, recommendation: Dict[str, Any]):
         """显示选择分析结果"""
@@ -105,7 +165,13 @@ class ModelSelectorNode(AsyncNode):
         if confidence:
             print(f"🎯 置信度: {confidence}")
 
-    async def _fallback_selection(self, question: str, available_models: List[ModelConfig]) -> Dict[str, Any]:
+    async def _fallback_selection(
+        self,
+        question: str,
+        available_models: List[ModelConfig],
+        trace_id: Optional[str] = None,
+        parent_observation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """传统选择方法作为回退"""
         print("🔄 使用传统问题类型分析...")
 
@@ -128,7 +194,10 @@ class ModelSelectorNode(AsyncNode):
         try:
             question_type = await call_llm_async(
                 messages=[{"role": "user", "content": analysis_prompt}],
-                model="gpt-41-0414-global"
+                model="gpt-41-0414-global",
+                trace_id=trace_id,
+                parent_observation_id=parent_observation_id,
+                langfuse_metadata={"node": "ModelSelector", "stage": "fallback_type_detection"}
             )
             question_type = question_type.strip()
             print(f"📊 问题类型: {question_type}")
@@ -195,9 +264,12 @@ class ParallelLLMNode(AsyncNode):
         super().__init__(max_retries=2, wait=1)
 
     async def prep_async(self, shared):
-        """准备阶段：获取选定的模型和用户问题"""
+        """准备阶段：获取选定的模型、用户问题、registry 和 trace_id"""
         question = shared.get("user_question", "")
         selected_models = shared.get("selected_models", [])
+        registry = shared.get("registry")
+        trace_id = shared.get("trace_id")
+        trace_observation_id = shared.get("langfuse_trace_observation_id")
 
         if not question:
             raise ValueError("用户问题不能为空")
@@ -207,10 +279,21 @@ class ParallelLLMNode(AsyncNode):
 
         return {
             "question": question,
-            "models": selected_models
+            "models": selected_models,
+            "registry": registry,
+            "trace_id": trace_id,
+            "trace_observation_id": trace_observation_id
         }
 
-    async def call_single_llm(self, model_config: ModelConfig, question: str, model_index: int):
+    async def call_single_llm(
+        self,
+        model_config: ModelConfig,
+        question: str,
+        model_index: int,
+        registry=None,
+        trace_id=None,
+        parent_observation_id: Optional[str] = None,
+    ):
         """调用单个LLM模型"""
         start_time = time.time()
         try:
@@ -220,12 +303,22 @@ class ParallelLLMNode(AsyncNode):
                 {"role": "user", "content": question}
             ]
 
+            # 使用 registry 调用模型，传递 trace_id
             response = await call_llm_async(
                 messages=messages,
                 model=model_config.name,
-                api_key=model_config.api_key,
-                base_url=model_config.base_url
+                registry=registry,
+                trace_id=trace_id,
+                return_response_obj=True,
+                parent_observation_id=parent_observation_id,
+                langfuse_metadata={
+                    "component": "parallel_llm",
+                    "model_index": model_index + 1,
+                    "model_name": model_config.name,
+                },
             )
+            response_text = response.text
+            usage_details = response.usage
 
             end_time = time.time()
             response_time = end_time - start_time
@@ -233,12 +326,13 @@ class ParallelLLMNode(AsyncNode):
             print(f"✅ 模型 {model_index + 1} ({model_config.name}) 回答完成，耗时: {response_time:.2f}秒")
             print(f"📝 模型 {model_index + 1} 响应内容:")
             print(f"{'=' * 50}")
-            print(response[:200] + "..." if len(response) > 200 else response)
+            print(response_text[:200] + "..." if len(response_text) > 200 else response_text)
             print(f"{'=' * 50}\n")
 
             return {
                 "model_name": model_config.name,
-                "response": response,
+                "response": response_text,
+                "token_usage": usage_details,
                 "response_time": response_time,
                 "success": True,
                 "error": None,
@@ -262,12 +356,34 @@ class ParallelLLMNode(AsyncNode):
         """执行阶段：并发调用所有选定的LLM"""
         question = inputs["question"]
         models = inputs["models"]
+        registry = inputs["registry"]
+        trace_id = inputs["trace_id"]
+        trace_observation_id = inputs.get("trace_observation_id")
 
         print(f"🚀 开始并发调用 {len(models)} 个LLM模型...")
 
-        # 并发调用所有模型
+        parallel_span = create_span(
+            trace_id,
+            name="ParallelLLM",
+            parent_observation_id=trace_observation_id,
+            input_data={
+                "question": question,
+                "selected_models": [model.name for model in models],
+            },
+            metadata={"node": "ParallelLLM"},
+        )
+        generation_parent_id = parallel_span.id if parallel_span else trace_observation_id
+
+        # 并发调用所有模型，传递 trace_id
         tasks = [
-            self.call_single_llm(model, question, i)
+            self.call_single_llm(
+                model,
+                question,
+                i,
+                registry=registry,
+                trace_id=trace_id,
+                parent_observation_id=generation_parent_id,
+            )
             for i, model in enumerate(models)
         ]
 
@@ -290,6 +406,26 @@ class ParallelLLMNode(AsyncNode):
                 failed_responses.append(result)
 
         print(f"📊 调用结果: {len(successful_responses)} 成功, {len(failed_responses)} 失败")
+
+        finish_observation(
+            parallel_span,
+            output_data={
+                "successful": [
+                    {
+                        "model_name": r["model_name"],
+                        "response_time": r["response_time"],
+                        "token_usage": r.get("token_usage"),
+                    }
+                    for r in successful_responses
+                ],
+                "failed": [
+                    {"model_name": r.get("model_name"), "error": r.get("error")}
+                    for r in failed_responses
+                ],
+            },
+            metadata={"node": "ParallelLLM"},
+            level="ERROR" if successful_responses == [] else None,
+        )
 
         return {
             "successful_responses": successful_responses,
@@ -322,10 +458,13 @@ class FusionAgentNode(AsyncNode):
         super().__init__(max_retries=3, wait=2)
 
     async def prep_async(self, shared):
-        """准备阶段：获取所有LLM的回答"""
+        """准备阶段：获取所有LLM的回答、registry 和 trace_id"""
         question = shared.get("user_question", "")
         responses = shared.get("llm_responses", [])
         question_type = shared.get("question_type", "未知")
+        registry = shared.get("registry")
+        trace_id = shared.get("trace_id")
+        trace_observation_id = shared.get("langfuse_trace_observation_id")
 
         if not question:
             raise ValueError("用户问题不能为空")
@@ -336,7 +475,10 @@ class FusionAgentNode(AsyncNode):
         return {
             "question": question,
             "responses": responses,
-            "question_type": question_type
+            "question_type": question_type,
+            "registry": registry,
+            "trace_id": trace_id,
+            "trace_observation_id": trace_observation_id
         }
 
     async def exec_async(self, inputs):
@@ -344,26 +486,67 @@ class FusionAgentNode(AsyncNode):
         question = inputs["question"]
         responses = inputs["responses"]
         question_type = inputs["question_type"]
+        registry = inputs["registry"]
+        trace_id = inputs["trace_id"]
+        trace_observation_id = inputs.get("trace_observation_id")
 
         print("🧠 正在使用AI代理融合多个回答...")
 
         # 构建融合提示
         fusion_prompt = self._build_fusion_prompt(question, responses, question_type)
 
+        fusion_span = create_span(
+            trace_id,
+            name="FusionAgent",
+            parent_observation_id=trace_observation_id,
+            input_data={
+                "question": question,
+                "question_type": question_type,
+                "model_count": len(responses),
+            },
+            metadata={"node": "FusionAgent"},
+        )
+        generation_parent_id = fusion_span.id if fusion_span else trace_observation_id
+
         try:
             # 使用高质量模型进行融合
             import os
             fusion_model = os.getenv("AI_FUSION_MODEL", "claude_sonnet4")
 
-            fused_answer = await call_llm_async(
+            response = await call_llm_async(
                 messages=[{"role": "user", "content": fusion_prompt}],
-                model=fusion_model
+                model=fusion_model,
+                registry=registry,
+                trace_id=trace_id,
+                return_response_obj=True,
+                parent_observation_id=generation_parent_id,
+                langfuse_metadata={
+                    "component": "fusion_agent",
+                    "question_type": question_type,
+                },
+            )
+            fused_answer = response.text
+
+            finish_observation(
+                fusion_span,
+                output_data={
+                    "fused_answer": fused_answer,
+                    "token_usage": response.usage,
+                },
+                metadata={"node": "FusionAgent"},
             )
 
             return fused_answer
 
         except Exception as e:
             print(f"❌ 回答融合失败: {str(e)}")
+            finish_observation(
+                fusion_span,
+                output_data={"error": str(e)},
+                metadata={"node": "FusionAgent"},
+                level="ERROR",
+                status_message=str(e),
+            )
             # 如果融合失败，返回第一个可用的回答
             if responses:
                 return f"融合失败，以下是第一个模型的回答：\n\n{responses[0]['response']}"
@@ -415,13 +598,16 @@ class QualityAnalyzerNode(AsyncNode):
 
     def __init__(self):
         super().__init__(max_retries=2, wait=1)
-        self.analyzer = AIFusionQualityAnalyzer()
+        self.analyzer = None  # 将在 prep_async 中初始化
 
     async def prep_async(self, shared):
-        """准备阶段：获取问题、回答和融合结果"""
+        """准备阶段：获取问题、回答和融合结果以及registry"""
         question = shared.get("user_question", "")
         llm_responses = shared.get("llm_responses", [])
         final_answer = shared.get("final_answer", "")
+        registry = shared.get("registry")
+        trace_id = shared.get("trace_id")
+        trace_observation_id = shared.get("langfuse_trace_observation_id")
 
         if not question:
             raise ValueError("用户问题不能为空")
@@ -430,10 +616,16 @@ class QualityAnalyzerNode(AsyncNode):
             print("⚠️ 没有LLM回答，跳过质量分析")
             return None
 
+        # 初始化 analyzer（使用 registry）
+        if self.analyzer is None:
+            self.analyzer = AIFusionQualityAnalyzer(registry=registry)
+
         return {
             "question": question,
             "llm_responses": llm_responses,
-            "final_answer": final_answer
+            "final_answer": final_answer,
+            "trace_id": trace_id,
+            "trace_observation_id": trace_observation_id
         }
 
     async def exec_async(self, inputs):
@@ -441,15 +633,49 @@ class QualityAnalyzerNode(AsyncNode):
         if inputs is None:
             return None
 
+        trace_id = inputs.get("trace_id")
+        trace_observation_id = inputs.get("trace_observation_id")
+
+        analysis_span = create_span(
+            trace_id,
+            name="QualityAnalyzer",
+            parent_observation_id=trace_observation_id,
+            input_data={
+                "question": inputs["question"],
+                "final_answer": inputs["final_answer"][:200] if inputs["final_answer"] else "",
+                "response_count": len(inputs["llm_responses"]),
+            },
+            metadata={"node": "QualityAnalyzer"},
+        )
+        parent_observation_id = analysis_span.id if analysis_span else trace_observation_id
+
         print("\n🔍 正在进行质量分析...")
 
-        quality_analysis = await self.analyzer.analyze_quality(
-            question=inputs["question"],
-            llm_responses=inputs["llm_responses"],
-            fusion_answer=inputs["final_answer"]
-        )
+        try:
+            quality_analysis = await self.analyzer.analyze_quality(
+                question=inputs["question"],
+                llm_responses=inputs["llm_responses"],
+                fusion_answer=inputs["final_answer"],
+                trace_id=trace_id,
+                parent_observation_id=parent_observation_id,
+            )
 
-        return quality_analysis
+            finish_observation(
+                analysis_span,
+                output_data={"quality_analysis": quality_analysis},
+                metadata={"node": "QualityAnalyzer"},
+            )
+
+            return quality_analysis
+        except Exception as exc:
+            finish_observation(
+                analysis_span,
+                output_data={"error": str(exc)},
+                metadata={"node": "QualityAnalyzer"},
+                level="ERROR",
+                status_message=str(exc),
+            )
+            raise
 
     async def post_async(self, shared, prep_res, exec_res):
         """后处理阶段：保存质量分析结果"""

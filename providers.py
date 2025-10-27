@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Type
 from enum import Enum
 from openai import AsyncOpenAI
 from anthropic import AsyncAnthropic
+from langfuse_tracer import finish_observation, start_generation
 
 
 # ============================================
@@ -65,6 +66,15 @@ class ModelInfo:
                 "coding": PerformanceLevel.MEDIUM,
                 "factual": PerformanceLevel.MEDIUM,
             }
+
+
+@dataclass
+class ModelResponsePayload:
+    """标准化的模型调用返回结果"""
+
+    text: str
+    usage: Optional[Dict[str, int]] = None
+    raw: Any = None
 
 
 # ============================================
@@ -312,7 +322,7 @@ class UniversalProvider(BaseProvider):
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         **kwargs
-    ) -> str:
+    ) -> ModelResponsePayload:
         if not self.client:
             raise ValueError(f"{self.provider_name} provider is not available")
 
@@ -323,7 +333,20 @@ class UniversalProvider(BaseProvider):
             max_tokens=max_tokens or 2000,
             **kwargs
         )
-        return response.choices[0].message.content
+        text = response.choices[0].message.content
+        usage = None
+        if getattr(response, "usage", None):
+            usage = {
+                "prompt_tokens": getattr(response.usage, "prompt_tokens", None),
+                "completion_tokens": getattr(response.usage, "completion_tokens", None),
+                "total_tokens": getattr(response.usage, "total_tokens", None),
+            }
+
+        raw_payload = None
+        if hasattr(response, "model_dump"):
+            raw_payload = response.model_dump()
+
+        return ModelResponsePayload(text=text, usage=usage, raw=raw_payload or response)
 
 
 # ============================================
@@ -397,7 +420,7 @@ class AnthropicProvider(BaseProvider):
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         **kwargs
-    ) -> str:
+    ) -> ModelResponsePayload:
         if not self.client:
             raise ValueError(f"{self.provider_name} provider is not available")
 
@@ -419,7 +442,25 @@ class AnthropicProvider(BaseProvider):
             max_tokens=max_tokens or 4096,
             **kwargs
         )
-        return response.content[0].text
+        text = response.content[0].text if response.content else ""
+        usage_details = None
+        if getattr(response, "usage", None):
+            prompt_tokens = getattr(response.usage, "input_tokens", None)
+            completion_tokens = getattr(response.usage, "output_tokens", None)
+            total_tokens = None
+            if prompt_tokens is not None and completion_tokens is not None:
+                total_tokens = prompt_tokens + completion_tokens
+            usage_details = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
+
+        raw_payload = None
+        if hasattr(response, "model_dump"):
+            raw_payload = response.model_dump()
+
+        return ModelResponsePayload(text=text, usage=usage_details, raw=raw_payload or response)
 
 
 # ============================================
@@ -515,9 +556,22 @@ class ModelRegistry:
         self,
         model_id: str,
         messages: List[Dict[str, str]],
+        trace_id: Optional[str] = None,
+        parent_observation_id: Optional[str] = None,
+        langfuse_metadata: Optional[Dict[str, Any]] = None,
         **kwargs
-    ) -> str:
-        """调用指定模型"""
+    ) -> ModelResponsePayload:
+        """
+        调用指定模型，并记录到 Langfuse
+
+        Args:
+            model_id: 模型ID
+            messages: 消息列表
+            trace_id: Langfuse trace ID（可选）
+            parent_observation_id: Langfuse 父 span ID（可选）
+            langfuse_metadata: 额外的 Langfuse 元数据（可选）
+            **kwargs: 其他参数（如 temperature, max_tokens）
+        """
         model_info = self.get_model(model_id)
         if not model_info:
             raise ValueError(f"未找到模型: {model_id}")
@@ -526,7 +580,68 @@ class ModelRegistry:
         if not provider:
             raise ValueError(f"提供商 {model_info.provider} 不可用")
 
-        return await provider.call_model(model_id, messages, **kwargs)
+        temperature = kwargs.get("temperature", 0.7)
+        max_tokens = kwargs.get("max_tokens")
+
+        generation = start_generation(
+            trace_id,
+            name=f"call_model_{model_id}",
+            model=model_id,
+            parent_observation_id=parent_observation_id,
+            input_messages=messages,
+            metadata={
+                "provider": model_info.provider,
+                "display_name": model_info.display_name,
+                **(langfuse_metadata or {}),
+            },
+            model_parameters={
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+        )
+
+        try:
+            # 调用模型
+            response = await provider.call_model(model_id, messages, **kwargs)
+
+            usage_details = response.usage
+            if usage_details is None:
+                prompt_tokens = sum(len(msg.get("content", "")) // 4 for msg in messages)
+                completion_tokens = len(response.text) // 4
+                usage_details = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                }
+
+            # 记录到 Langfuse
+            if trace_id:
+                finish_observation(
+                    generation,
+                    output_data=response.text,
+                    metadata={
+                        "provider": model_info.provider,
+                        "display_name": model_info.display_name,
+                        **(langfuse_metadata or {}),
+                    },
+                    usage=usage_details,
+                )
+
+            return response
+
+        except Exception as e:
+            if trace_id:
+                finish_observation(
+                    generation,
+                    output_data={"error": str(e)},
+                    metadata={
+                        "provider": model_info.provider,
+                        **(langfuse_metadata or {}),
+                    },
+                    level="ERROR",
+                    status_message=str(e),
+                )
+            raise
 
     def list_available_providers(self) -> List[str]:
         """列出所有可用的提供商"""
